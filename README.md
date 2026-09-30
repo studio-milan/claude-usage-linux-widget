@@ -21,7 +21,10 @@ One desktop notification per window, per event:
 ·	Last 24 hours of the week with less than 85% used: use it or lose it (your Friday morning).
 
 Thresholds are constants at the top of the script (SESSION_ALERT, PACE_MARGIN, WEEK_LAST_CALL_HOURS, WEEK_LAST_CALL_BELOW, POLL_SECONDS).
-Install
+
+
+
+Install (requires all files to be in the same folder)
 
 chmod +x install-Rev00.sh
 
