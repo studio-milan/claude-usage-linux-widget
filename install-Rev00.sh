@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# Claude Usage Indicator - installer Rev00
+# Claude Usage Indicator - installer Rev04
+# Credits - Ing. Rocco Abram - rocco.abram@3ngi.com - https://github.com/studio-milan/
+
 set -euo pipefail
 
-REV="Rev00"
+REV="Rev04"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SRC="$HERE/claude-usage-indicator-${REV}.py"
 BIN="$HOME/.local/bin/claude-usage-indicator-${REV}.py"
@@ -18,6 +20,7 @@ gnome-extensions enable ubuntu-appindicators@ubuntu.com 2>/dev/null || true
 
 echo "==> Installing script to $BIN"
 mkdir -p "$HOME/.local/bin" "$AUTOSTART"
+find "$HOME/.local/bin" -name "claude-usage-indicator-Rev*.py" ! -name "claude-usage-indicator-${REV}.py" -delete
 install -m 755 "$SRC" "$BIN"
 
 echo "==> Registering autostart (older revisions are removed)"
