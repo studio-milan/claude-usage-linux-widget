@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
-Claude Usage Indicator - Rev00
+Claude Usage Indicator - Rev04
+
+Credits - Ing. Rocco Abram - rocco.abram@3ngi.com - https://github.com/studio-milan/
 
 Ubuntu status bar indicator for Claude subscription usage:
   - 5-hour session window  (outer ring)
@@ -11,8 +13,8 @@ authenticated with the OAuth (Open Authorization) token that Claude Code keeps
 in ~/.claude/.credentials.json. The token is sent only to api.anthropic.com.
 
 Usage:
-  claude-usage-indicator-Rev00.py          run the status bar indicator
-  claude-usage-indicator-Rev00.py --once   print a text summary and exit
+  claude-usage-indicator-Rev04.py          run the status bar indicator
+  claude-usage-indicator-Rev04.py --once   print a text summary and exit
 """
 
 import hashlib
@@ -28,7 +30,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # ---------------------------------------------------------------- settings --
-REV = "Rev00"
+REV = "Rev04"
 APP_ID = "claude-usage-indicator"
 CREDS_FILE = Path.home() / ".claude" / ".credentials.json"
 CACHE_DIR = Path.home() / ".cache" / APP_ID
@@ -49,7 +51,7 @@ WEEK_LEN = timedelta(days=7)
 
 COLORS = {"green": "#43a047", "amber": "#ffb300", "red": "#e53935", "grey": "#9e9e9e"}
 TRACK = "#6b6b6b"
-ADVICE = {"green": "go heavy", "amber": "on pace", "red": "save", "grey": "idle"}
+ADVICE = {"green": "go heavy", "amber": "ease off", "red": "save", "grey": "idle"}
 
 
 # ------------------------------------------------------------------ model --
@@ -84,15 +86,15 @@ class Window:
 
     def state(self, now):
         if self.resets_at is None:
-            return "grey" if self.used == 0 else "amber"
+            return "grey" if self.used == 0 else "green"
         if self.used >= 95:
             return "red"
         diff = self.used - self.elapsed_pct(now)
-        if diff > PACE_MARGIN:
+        if diff > 2 * PACE_MARGIN:
             return "red"
-        if diff < -PACE_MARGIN:
-            return "green"
-        return "amber"
+        if diff > PACE_MARGIN:
+            return "amber"
+        return "green"
 
     def key(self):
         """Stable identifier of this window instance (for one-shot alerts)."""
@@ -122,8 +124,8 @@ def fmt_reset(dt, now):
 
 
 def panel_label(s, w, now):
-    return (f"S{s.used:.0f}% {fmt_countdown(s.remaining(now))}"
-            f" · W{w.used:.0f}% {fmt_countdown(w.remaining(now))}")
+    return (f"{s.used:.0f}% {fmt_countdown(s.remaining(now))}"
+            f" · W {w.used:.0f}% {fmt_countdown(w.remaining(now))}")
 
 
 def describe(s, w, now):
@@ -140,57 +142,241 @@ def describe(s, w, now):
         lines.append(f"   pace: {pace}{proj} -> {ADVICE[win.state(now)].upper()}")
     rem = w.remaining(now)
     if rem is not None and rem.total_seconds() > 0:
-        days = max(rem.total_seconds() / 86400, 1 / 24)
-        lines.append(f"Weekly budget: {max(0, 100 - w.used):.0f}% left, "
-                     f"about {max(0, 100 - w.used) / days:.0f}% per remaining day")
+        left = max(0, 100 - w.used)
+        if rem >= timedelta(days=1):
+            lines.append(f"Weekly budget: {left:.0f}% left, "
+                         f"about {left / (rem.total_seconds() / 86400):.0f}% per remaining day")
+        else:
+            lines.append(f"Weekly budget: {left:.0f}% left, resets in {fmt_countdown(rem)}")
     return lines
 
 
 # ------------------------------------------------------------------- data --
 class UsageError(Exception):
-    pass
+    """kind: login | wait | offline | error (drives the short panel label)."""
+
+    def __init__(self, kind, msg):
+        super().__init__(msg)
+        self.kind = kind
+
+
+LOG_FILE = CACHE_DIR / "log.txt"
+LAST_FILE = CACHE_DIR / "last.json"
+TOKEN_URLS = ("https://platform.claude.com/v1/oauth/token",
+              "https://console.anthropic.com/v1/oauth/token")
+CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"   # Claude Code public OAuth client
+EXTRA_PATHS = (".local/bin", ".npm-global/bin", ".claude/local", ".bun/bin")
+_token_lock = threading.Lock()
+
+
+def log(msg):
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        if LOG_FILE.exists() and LOG_FILE.stat().st_size > 200_000:
+            LOG_FILE.replace(LOG_FILE.with_suffix(".old.txt"))
+        with LOG_FILE.open("a") as f:
+            f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} {msg}\n")
+    except Exception:
+        pass
 
 
 def claude_version():
-    try:
-        out = subprocess.run(["claude", "--version"], capture_output=True,
-                             text=True, timeout=10).stdout.strip()
-        return out.split()[0] if out else "2.1.0"
-    except Exception:
-        return "2.1.0"
+    """Autostart runs with a minimal PATH, so also try the usual install folders."""
+    candidates = ["claude"] + [str(Path.home() / p / "claude") for p in EXTRA_PATHS]
+    for exe in candidates:
+        try:
+            out = subprocess.run([exe, "--version"], capture_output=True,
+                                 text=True, timeout=10).stdout.strip()
+            if out:
+                return out.split()[0]
+        except Exception:
+            continue
+    return "2.1.0"
 
 
-def read_token():
+def load_creds():
     try:
         data = json.loads(CREDS_FILE.read_text())
     except FileNotFoundError:
-        raise UsageError("No Claude Code credentials: run 'claude' and log in")
+        raise UsageError("login", "No Claude Code credentials: run 'claude' and log in")
     except Exception as e:
-        raise UsageError(f"Cannot read credentials: {e}")
-    tok = (data.get("claudeAiOauth") or {}).get("accessToken")
-    if not tok:
-        raise UsageError("No OAuth token found: run 'claude' and log in")
-    return tok
+        raise UsageError("error", f"Cannot read credentials: {e}")
+    if not (data.get("claudeAiOauth") or {}).get("accessToken"):
+        raise UsageError("login", "No OAuth token found: run 'claude' and log in")
+    return data
 
 
-def fetch_usage(version):
+def save_creds(data):
+    """Atomic write, same file and permissions Claude Code uses."""
+    tmp = CREDS_FILE.with_name(".credentials.json.cui-tmp")
+    tmp.write_text(json.dumps(data, indent=2))
+    tmp.chmod(0o600)
+    tmp.replace(CREDS_FILE)
+
+
+def token_expired(oauth, margin=60):
+    exp = oauth.get("expiresAt")
+    return bool(exp) and exp / 1000 < time.time() + margin
+
+
+def renew_token(version, used_token):
+    """Renew the access token with the refresh token, like Claude Code does.
+    Re-reads the file first: if Claude Code already renewed it, nothing is sent."""
+    with _token_lock:
+        data = load_creds()
+        oauth = data["claudeAiOauth"]
+        if oauth["accessToken"] != used_token and not token_expired(oauth):
+            return oauth["accessToken"]
+        rt = oauth.get("refreshToken")
+        if not rt:
+            raise UsageError("login", "No refresh token: run 'claude' and log in")
+        body = json.dumps({"grant_type": "refresh_token", "refresh_token": rt,
+                           "client_id": CLIENT_ID}).encode()
+        last_err = None
+        for url in TOKEN_URLS:
+            req = urllib.request.Request(url, data=body, method="POST", headers={
+                "Content-Type": "application/json",
+                "anthropic-beta": "oauth-2025-04-20",
+                "User-Agent": f"claude-cli/{version} (external)",
+            })
+            try:
+                with urllib.request.urlopen(req, timeout=15) as r:
+                    resp = json.loads(r.read().decode())
+            except urllib.error.HTTPError as e:
+                last_err = e
+                if e.code == 404:
+                    continue
+                if e.code in (400, 401, 403):
+                    log(f"token renewal refused by {url}: HTTP {e.code}")
+                    raise UsageError("login", "Login expired: run 'claude' and log in again")
+                log(f"token renewal at {url}: HTTP {e.code}")
+                continue
+            except urllib.error.URLError as e:
+                raise UsageError("offline", f"Network error: {e.reason}")
+            oauth["accessToken"] = resp["access_token"]
+            if resp.get("refresh_token"):
+                oauth["refreshToken"] = resp["refresh_token"]
+            if resp.get("expires_in"):
+                oauth["expiresAt"] = int((time.time() + int(resp["expires_in"])) * 1000)
+            save_creds(data)
+            log(f"token renewed via {url}")
+            return oauth["accessToken"]
+        if isinstance(last_err, urllib.error.HTTPError) and last_err.code == 429:
+            raise UsageError("wait", "Rate limited during token renewal")
+        raise UsageError("error", f"Token renewal failed: {last_err}")
+
+
+CLI_STAMP = CACHE_DIR / "cli-renew.txt"
+CLI_MIN_INTERVAL = 2 * 3600   # never run the fallback more than once every 2 hours
+
+
+def find_claude():
+    import shutil
+    exe = shutil.which("claude")
+    if exe:
+        return exe
+    for p in EXTRA_PATHS:
+        cand = Path.home() / p / "claude"
+        if cand.exists():
+            return str(cand)
+    return None
+
+
+def cli_renew():
+    """Fallback (option A): one minimal Claude Code call with the smallest model.
+    Claude Code renews and saves the token itself. Uses a negligible amount of
+    usage and starts the 5-hour session window. Returns True if the token is now valid."""
+    try:
+        last = float(CLI_STAMP.read_text())
+    except Exception:
+        last = 0
+    if time.time() - last < CLI_MIN_INTERVAL:
+        log("CLI renewal skipped: already tried less than 2 hours ago")
+        return False
+    exe = find_claude()
+    if not exe:
+        log("CLI renewal impossible: claude executable not found")
+        return False
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    CLI_STAMP.write_text(str(time.time()))
+    work = CACHE_DIR / "cli-workdir"          # empty folder: no project files involved
+    work.mkdir(exist_ok=True)
+    log("CLI renewal: running claude -p with Haiku")
+    try:
+        r = subprocess.run([exe, "-p", "Reply only: ok", "--model", "haiku", "--max-turns", "1"],
+                           cwd=work, capture_output=True, text=True, timeout=120,
+                           stdin=subprocess.DEVNULL)
+        log(f"CLI renewal exit code {r.returncode}")
+    except Exception as e:
+        log(f"CLI renewal failed: {e}")
+        return False
+    try:
+        return not token_expired(load_creds()["claudeAiOauth"])
+    except UsageError:
+        return False
+
+
+def renew_with_fallback(version, used_token):
+    try:
+        return renew_token(version, used_token)
+    except UsageError as e:
+        if e.kind == "offline":
+            raise
+        log(f"self-renewal failed ({e.kind}): {e}")
+        if cli_renew():
+            log("token renewed by Claude Code (CLI fallback)")
+            return load_creds()["claudeAiOauth"]["accessToken"]
+        raise
+
+
+def _get_usage(token, version):
     req = urllib.request.Request(ENDPOINT, headers={
-        "Authorization": f"Bearer {read_token()}",
+        "Authorization": f"Bearer {token}",
         "anthropic-beta": "oauth-2025-04-20",
         "User-Agent": f"claude-code/{version}",
         "Content-Type": "application/json",
     })
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return json.loads(r.read().decode())
+
+
+def fetch_usage(version):
+    oauth = load_creds()["claudeAiOauth"]
+    token = oauth["accessToken"]
+    if token_expired(oauth):
+        token = renew_with_fallback(version, token)
+    for attempt in (1, 2):
+        try:
+            return _get_usage(token, version)
+        except urllib.error.HTTPError as e:
+            if e.code == 401 and attempt == 1:
+                token = renew_with_fallback(version, token)
+                continue
+            if e.code == 401:
+                raise UsageError("login", "Token rejected: run 'claude' and log in again")
+            if e.code == 429:
+                raise UsageError("wait", "Rate limited by Anthropic, will retry")
+            raise UsageError("error", f"HTTP error {e.code}")
+        except urllib.error.URLError as e:
+            raise UsageError("offline", f"Network error: {e.reason}")
+        except (TimeoutError, OSError) as e:
+            raise UsageError("offline", f"Network error: {e}")
+
+
+def save_last(data):
     try:
-        with urllib.request.urlopen(req, timeout=15) as r:
-            return json.loads(r.read().decode())
-    except urllib.error.HTTPError as e:
-        if e.code == 401:
-            raise UsageError("Token expired: open Claude Code once to refresh it")
-        if e.code == 429:
-            raise UsageError("Rate limited by Anthropic, will retry")
-        raise UsageError(f"HTTP error {e.code}")
-    except urllib.error.URLError as e:
-        raise UsageError(f"Network error: {e.reason}")
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        LAST_FILE.write_text(json.dumps({"saved": time.time(), "data": data}))
+    except Exception:
+        pass
+
+
+def load_last():
+    try:
+        j = json.loads(LAST_FILE.read_text())
+        return j["data"], datetime.fromtimestamp(j["saved"])
+    except Exception:
+        return None, None
 
 
 # ------------------------------------------------------------------- icon --
@@ -281,7 +467,7 @@ def run_once():
     try:
         data = fetch_usage(claude_version())
     except UsageError as e:
-        print(f"Error: {e}")
+        print(f"Error ({e.kind}): {e}")
         return 1
     now = datetime.now(timezone.utc)
     s, w = Window("session", SESSION_LEN, data.get("five_hour")), Window("week", WEEK_LEN, data.get("seven_day"))
@@ -303,12 +489,19 @@ def run_indicator():
     from gi.repository import GLib, Gtk
 
     class Indicator:
+        RETRY_BOOT = 30        # seconds between retries while no data is available
+        MAX_BACKOFF = 900      # longest wait after rate limiting
+
         def __init__(self):
             self.version = claude_version()
-            self.data = None
+            log(f"start {REV}, claude version {self.version}")
+            self.data, self.last_ok = load_last()
+            self.cached = self.data is not None   # True until fresh data arrives
             self.error = None
-            self.last_ok = None
-            self.busy = False
+            self.error_kind = None
+            self.busy_since = None
+            self.backoff = POLL_SECONDS
+            self.timer = None
             self.notified = load_notified()
 
             ICON_DIR.mkdir(parents=True, exist_ok=True)
@@ -327,7 +520,7 @@ def run_indicator():
             self.status_item = Gtk.MenuItem(label="Loading...")
             self.status_item.set_sensitive(False)
             self.menu.append(self.status_item)
-            for label, cb in (("Refresh now", lambda *_: self.refresh()),
+            for label, cb in (("Refresh now", lambda *_: self.refresh(force=True)),
                               ("Open claude.ai usage page", self.open_page),
                               (f"Quit ({REV})", lambda *_: Gtk.main_quit())):
                 it = Gtk.MenuItem(label=label)
@@ -338,7 +531,6 @@ def run_indicator():
 
             self.render()
             self.refresh()
-            GLib.timeout_add_seconds(POLL_SECONDS, self.refresh)
             GLib.timeout_add_seconds(TICK_SECONDS, self.tick)
 
         def open_page(self, *_):
@@ -348,56 +540,90 @@ def run_indicator():
             self.render()
             return True
 
-        def refresh(self):
-            if not self.busy:
-                self.busy = True
-                threading.Thread(target=self._fetch, daemon=True).start()
-            return True
+        def schedule(self, seconds):
+            if self.timer:
+                GLib.source_remove(self.timer)
+            self.timer = GLib.timeout_add_seconds(int(seconds), self._timer_fired)
+
+        def _timer_fired(self):
+            self.timer = None
+            self.refresh()
+            return False
+
+        def refresh(self, force=False):
+            # watchdog: a fetch stuck for more than 150 s is abandoned (CLI fallback may take up to 120 s)
+            if self.busy_since and time.time() - self.busy_since < 150:
+                return
+            if force:
+                self.backoff = POLL_SECONDS
+            self.busy_since = time.time()
+            if force:
+                self.status_item.set_label("Refreshing...")
+            threading.Thread(target=self._fetch, daemon=True).start()
 
         def _fetch(self):
             try:
-                data, err = fetch_usage(self.version), None
+                data, err, kind = fetch_usage(self.version), None, None
             except UsageError as e:
-                data, err = None, str(e)
+                data, err, kind = None, str(e), e.kind
             except Exception as e:
-                data, err = None, f"Unexpected error: {e}"
-            GLib.idle_add(self._on_result, data, err)
+                data, err, kind = None, f"Unexpected error: {e}", "error"
+            if err:
+                log(f"fetch failed ({kind}): {err}")
+            GLib.idle_add(self._on_result, data, err, kind)
 
-        def _on_result(self, data, err):
-            self.busy = False
+        def _on_result(self, data, err, kind):
+            self.busy_since = None
             if data is not None:
-                self.data, self.error, self.last_ok = data, None, datetime.now()
+                self.data, self.last_ok, self.cached = data, datetime.now(), False
+                self.error = self.error_kind = None
+                self.backoff = POLL_SECONDS
+                save_last(data)
+                self.schedule(POLL_SECONDS)
             else:
-                self.error = err
+                self.error, self.error_kind = err, kind
+                if kind == "wait":
+                    self.backoff = min(self.backoff * 2, self.MAX_BACKOFF)
+                    self.schedule(self.backoff)
+                elif self.data is None or self.cached:
+                    self.schedule(self.RETRY_BOOT)      # boot: network or token not ready yet
+                else:
+                    self.schedule(POLL_SECONDS)
             self.render(alerts=data is not None)
             return False
 
         def render(self, alerts=False):
             now = datetime.now(timezone.utc)
+            short = {"login": "Claude: login", "wait": "Claude: wait",
+                     "offline": "Claude: offline", "error": "Claude: error"}
             if self.data is None:
                 svg = ('<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22">'
                        f'<circle cx="11" cy="11" r="8" fill="none" stroke="{COLORS["grey"]}" stroke-width="3"/></svg>')
                 name, _ = write_icon(svg)
                 self.ind.set_icon_full(name, "Claude usage")
-                self.ind.set_label("Claude ?", "Claude ?")
-                self.status_item.set_label(self.error or "Loading...")
-                self.ind.set_title(self.error or "Claude usage: loading")
+                text = short.get(self.error_kind, "Claude: starting")
+                self.ind.set_label(text, "Claude: offline")
+                self.status_item.set_label(self.error or "Connecting...")
+                self.ind.set_title(self.error or "Claude usage: connecting")
+                for item in self.info_items:
+                    item.set_visible(False)
                 return
 
             s = Window("session", SESSION_LEN, self.data.get("five_hour"))
             w = Window("week", WEEK_LEN, self.data.get("seven_day"))
             name, path = write_icon(ring_svg(s, w, now))
             self.ind.set_icon_full(name, "Claude usage")
-            stale = " !" if self.error else ""
-            self.ind.set_label(panel_label(s, w, now) + stale, "S100% 4:59 · W100% 6d23h !")
+            reason = {"login": " login", "wait": " wait", "offline": " offline", "error": " error"}
+            stale = (" !" + reason.get(self.error_kind, "")) if (self.error or self.cached) else ""
+            self.ind.set_label(panel_label(s, w, now) + stale, "100% 4:59 · W 100% 6d23h ! offline")
 
             lines = describe(s, w, now)
             for item, text in zip(self.info_items, lines + [""] * 5):
                 item.set_label(text)
                 item.set_visible(bool(text))
-            updated = self.last_ok.strftime("%H:%M") if self.last_ok else "--"
-            self.status_item.set_label(
-                f"Updated {updated}" + (f" - {self.error}" if self.error else ""))
+            updated = self.last_ok.strftime("%d/%m %H:%M") if self.last_ok else "--"
+            note = f" - {self.error}" if self.error else (" - saved reading, refreshing" if self.cached else "")
+            self.status_item.set_label(f"Updated {updated}{note}")
             # Hover text: shown only if the panel host supports indicator tooltips
             self.ind.set_title("\n".join(lines))
 
